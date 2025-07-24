@@ -1,0 +1,17 @@
+[package]
+name = "cardinal_viewports"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+egui = { workspace = true, features = ["callstack", "default", "log"] }
+eframe = { workspace = true, features = [
+    "default",
+    "__screenshot", # __screenshot is so we can dump a screenshot using EFRAME_SCREENSHOT_TO
+] }
+winapi = "0.3.9"
+
+[[bin]]
+name = "cardinal_viewports"
+path = "main.rs"

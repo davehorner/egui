@@ -701,6 +701,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cardinal_viewports"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "winapi",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
