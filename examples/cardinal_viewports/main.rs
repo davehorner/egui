@@ -3,6 +3,10 @@
 
 use eframe::egui;
 use egui::{ViewportBuilder, ViewportId};
+use log::info;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+mod monitor_info;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Direction {
@@ -25,10 +29,10 @@ impl Direction {
 
     fn vector(&self) -> (f32, f32) {
         match self {
-            Direction::North => (0.0, -1.0), // move up (away from center)
-            Direction::South => (0.0, 1.0),  // move down (away from center)
-            Direction::West => (-1.0, 0.0),  // move left (away from center)
-            Direction::East => (1.0, 0.0),   // move right (away from center)
+            Direction::North => (0.0, -1.0), // move up
+            Direction::South => (0.0, 1.0),  // move down
+            Direction::West => (-1.0, 0.0),  // move left
+            Direction::East => (1.0, 0.0),   // move right
         }
     }
 }
@@ -38,16 +42,29 @@ struct CardinalViewport {
     position: egui::Pos2,
     velocity: f32,
     open: bool,
+    monitor_rect: egui::Rect,
+    movement: (f32, f32),
 }
 
 pub struct CardinalViewportsApp {
     viewports: Vec<CardinalViewport>,
+    collision_enabled: bool,
+    wrap_mode: WrapMode,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum WrapMode {
+    ParentRect,
+    MonitorOfSpawn,
+    AllMonitors,
 }
 
 impl Default for CardinalViewportsApp {
     fn default() -> Self {
         Self {
             viewports: Vec::new(),
+            collision_enabled: true,
+            wrap_mode: WrapMode::MonitorOfSpawn,
         }
     }
 }
@@ -74,6 +91,20 @@ impl eframe::App for CardinalViewportsApp {
                 if ui.button("East").clicked() {
                     spawn_direction = Some(Direction::East);
                 }
+                ui.separator();
+                ui.checkbox(&mut self.collision_enabled, "Collision Detection");
+                ui.separator();
+                egui::ComboBox::from_label("Wrap Mode")
+                    .selected_text(match self.wrap_mode {
+                        WrapMode::ParentRect => "Parent Rect",
+                        WrapMode::MonitorOfSpawn => "Monitor of Spawn",
+                        WrapMode::AllMonitors => "All Monitors",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.wrap_mode, WrapMode::ParentRect, "Parent Rect");
+                        ui.selectable_value(&mut self.wrap_mode, WrapMode::MonitorOfSpawn, "Monitor of Spawn");
+                        ui.selectable_value(&mut self.wrap_mode, WrapMode::AllMonitors, "All Monitors");
+                    });
             });
         });
 
@@ -84,78 +115,123 @@ impl eframe::App for CardinalViewportsApp {
         }
 
         if let Some(direction) = spawn_direction {
-            if let (Some(parent_rect), Some(monitor_size)) = (
-                ctx.input(|i| i.viewport().outer_rect),
-                ctx.input(|i| i.viewport().monitor_size),
-            ) {
-                let offset = 100.0;
-                let monitor_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
-                let start_pos = match direction {
-                    Direction::North => {
-                        egui::pos2(parent_rect.center().x, parent_rect.top() - offset)
-                    } // above window
-                    Direction::South => {
-                        egui::pos2(parent_rect.center().x, parent_rect.bottom() + offset)
-                    } // below window
-                    Direction::West => {
-                        egui::pos2(parent_rect.left() - offset, parent_rect.center().y)
-                    } // left of window
-                    Direction::East => {
-                        egui::pos2(parent_rect.right() + offset, parent_rect.center().y)
-                    } // right of window
-                };
+            if let Some(parent_rect) = ctx.input(|i| i.viewport().outer_rect) {
+                let monitor_rects: Vec<egui::Rect> =
+                    unsafe { monitor_info::MONITOR_RECTS.lock().unwrap().clone() };
+                let collision_radius = 100.0;
+                let (dx, dy) = direction.vector();
+                let start_pos = egui::pos2(
+                    parent_rect.center().x + dx * (collision_radius + 8.0),
+                    parent_rect.center().y + dy * (collision_radius + 8.0),
+                );
+                let spawn_monitor_rect = monitor_rects
+                    .iter()
+                    .find(|r| r.contains(start_pos))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        monitor_rects
+                            .get(0)
+                            .cloned()
+                            .unwrap_or(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::Vec2::new(1920.0, 1080.0),
+                            ))
+                    });
                 self.viewports.push(CardinalViewport {
                     direction,
                     position: start_pos,
                     velocity: 8.0,
                     open: true,
+                    monitor_rect: spawn_monitor_rect,
+                    movement: (dx, dy),
                 });
             }
         }
 
-        if let (Some(parent_rect), Some(monitor_size)) = (
-            ctx.input(|i| i.viewport().outer_rect),
-            ctx.input(|i| i.viewport().monitor_size),
-        ) {
-            let monitor_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
+        if let Some(parent_rect) = ctx.input(|i| i.viewport().outer_rect) {
+            let monitor_rects: Vec<egui::Rect> = ctx.input(|i| {
+                i.raw
+                    .viewports
+                    .values()
+                    .filter_map(|v| v.outer_rect)
+                    .collect()
+            });
+            let all_monitors_rect = monitor_rects.iter().fold(
+                if let Some(first) = monitor_rects.first() {
+                    *first
+                } else {
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1920.0, 1080.0))
+                },
+                |acc, r| acc.union(*r),
+            );
+            // Debug: print monitor rects
+            #[cfg(debug_assertions)]
+            {
+                println!("[DEBUG] Monitor rects:");
+                for (idx, r) in monitor_rects.iter().enumerate() {
+                    println!(
+                        " {} Monitor {idx}: min=({:.1},{:.1}) max=({:.1},{:.1}) size=({:.1},{:.1})",
+                        idx,
+                        r.min.x,
+                        r.min.y,
+                        r.max.x,
+                        r.max.y,
+                        r.width(),
+                        r.height()
+                    );
+                }
+                println!("[DEBUG] All monitors union: min=({:.1},{:.1}) max=({:.1},{:.1}) size=({:.1},{:.1})", all_monitors_rect.min.x, all_monitors_rect.min.y, all_monitors_rect.max.x, all_monitors_rect.max.y, all_monitors_rect.width(), all_monitors_rect.height());
+            }
             for (i, viewport) in self.viewports.iter_mut().enumerate() {
                 if !viewport.open {
                     continue;
                 }
-                let (dx, dy) = viewport.direction.vector();
+                // Animate movement
+                let (dx, dy) = viewport.movement;
                 viewport.position.x += dx * viewport.velocity;
                 viewport.position.y += dy * viewport.velocity;
 
-                // Wrap around monitor bounds
-                if viewport.position.x < monitor_rect.left() {
-                    viewport.position.x = monitor_rect.right();
+                // Wrapping logic
+                let wrap_rect = match self.wrap_mode {
+                    WrapMode::ParentRect => parent_rect,
+                    WrapMode::MonitorOfSpawn => viewport.monitor_rect,
+                    WrapMode::AllMonitors => all_monitors_rect,
+                };
+                #[cfg(debug_assertions)]
+                {
+                    println!("[DEBUG] Viewport {i} {:?} wrap_mode={:?} wrap_rect: min=({:.1},{:.1}) max=({:.1},{:.1}) size=({:.1},{:.1}) pos=({:.1},{:.1})", viewport.direction, self.wrap_mode, wrap_rect.min.x, wrap_rect.min.y, wrap_rect.max.x, wrap_rect.max.y, wrap_rect.width(), wrap_rect.height(), viewport.position.x, viewport.position.y);
                 }
-                if viewport.position.x > monitor_rect.right() {
-                    viewport.position.x = monitor_rect.left();
+                if viewport.position.x < wrap_rect.left() {
+                    viewport.position.x = wrap_rect.right();
                 }
-                if viewport.position.y < monitor_rect.top() {
-                    viewport.position.y = monitor_rect.bottom();
+                if viewport.position.x > wrap_rect.right() {
+                    viewport.position.x = wrap_rect.left();
                 }
-                if viewport.position.y > monitor_rect.bottom() {
-                    viewport.position.y = monitor_rect.top();
+                if viewport.position.y < wrap_rect.top() {
+                    viewport.position.y = wrap_rect.bottom();
+                }
+                if viewport.position.y > wrap_rect.bottom() {
+                    viewport.position.y = wrap_rect.top();
                 }
 
                 // Collision with parent window
-                let parent_center = parent_rect.center();
-                let dist = ((viewport.position.x - parent_center.x).powi(2)
-                    + (viewport.position.y - parent_center.y).powi(2))
-                .sqrt();
-                if dist < 100.0 {
-                    // Beep and close
-                    #[cfg(target_os = "windows")]
-                    {
-                        unsafe { winapi::um::winuser::MessageBeep(0xFFFFFFFF) };
+                if self.collision_enabled {
+                    let parent_center = parent_rect.center();
+                    let dist = ((viewport.position.x - parent_center.x).powi(2)
+                        + (viewport.position.y - parent_center.y).powi(2))
+                    .sqrt();
+                    if dist < 100.0 {
+                        // Beep and close
+                        #[cfg(target_os = "windows")]
+                        {
+                            unsafe { winapi::um::winuser::MessageBeep(0xFFFFFFFF) };
+                        }
+                        #[cfg(target_os = "linux")]
+                        println!("\x07");
+                        #[cfg(target_os = "macos")]
+                        println!("\x07");
+                        viewport.open = false;
                     }
-                    #[cfg(target_os = "linux")]
-                    println!("\x07");
-                    #[cfg(target_os = "macos")]
-                    println!("\x07");
-                    viewport.open = false;
                 }
 
                 let viewport_id = ViewportId::from_hash_of(format!("cardinal_{i}"));
@@ -164,7 +240,9 @@ impl eframe::App for CardinalViewportsApp {
                     ViewportBuilder::default()
                         .with_title(format!("Viewport: {:?}", viewport.direction))
                         .with_inner_size([200.0, 100.0])
-                        .with_position(viewport.position),
+                        .with_position(viewport.position)
+                        .with_decorations(false)
+                        .with_always_on_top(),
                     move |ctx, class| {
                         if class == egui::ViewportClass::Embedded {
                             egui::Window::new("Cardinal Viewport").show(ctx, |ui| {
@@ -174,7 +252,15 @@ impl eframe::App for CardinalViewportsApp {
                             });
                         } else {
                             egui::CentralPanel::default().show(ctx, |ui| {
-                                ui.label(format!("Moving {:?}", viewport.direction));
+                                ui.vertical_centered(|ui| {
+                                    let dir_char = match viewport.direction {
+                                        Direction::North => "N",
+                                        Direction::South => "S",
+                                        Direction::East => "E",
+                                        Direction::West => "W",
+                                    };
+                                    ui.label(egui::RichText::new(dir_char).size(96.0).strong());
+                                });
                             });
                         }
                     },
@@ -187,9 +273,34 @@ impl eframe::App for CardinalViewportsApp {
 }
 fn main() {
     let options = eframe::NativeOptions::default();
-    eframe::run_native(
+    // --- External event loop pattern for monitor snarfing ---
+    use eframe::UserEvent;
+    use winit::event_loop::EventLoop;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .expect("Failed to build event loop");
+    monitor_info::fill_monitor_rects();
+    #[cfg(debug_assertions)]
+    {
+        let rects = monitor_info::MONITOR_RECTS.lock().unwrap();
+        println!("[DEBUG] Filled MONITOR_RECTS: {} monitors", rects.len());
+        for (i, r) in rects.iter().enumerate() {
+            println!(
+                "  Monitor {i}: min=({:.1},{:.1}) max=({:.1},{:.1}) size=({:.1},{:.1})",
+                r.min.x,
+                r.min.y,
+                r.max.x,
+                r.max.y,
+                r.width(),
+                r.height()
+            );
+        }
+    }
+    let mut app = eframe::create_native(
         "Cardinal Viewports",
         options,
         Box::new(|_cc| Ok(Box::new(CardinalViewportsApp::default()))),
+        &event_loop,
     );
+    event_loop.run_app(&mut app).expect("eframe app failed");
 }
